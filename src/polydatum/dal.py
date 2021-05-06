@@ -1,10 +1,191 @@
 from __future__ import absolute_import
+from __future__ import annotations
 from contextlib import contextmanager
-from .context import DataAccessContext
 from polydatum.errors import AlreadyExistsException
 from polydatum.util import is_generator
 from .resources import ResourceManager
 from .context import _ctx_stack
+from typing import Callable, Tuple, Dict, Optional, Any
+from dataclasses import dataclass
+from functools import partial, update_wrapper
+
+from polydatum.context import DataAccessContext
+
+
+class DalMethodRequest:
+    """
+    Mutable request state. Middleware can modify this.
+    """
+
+    def __init__(
+            self, ctx: DataAccessContext, path: Tuple[PathSegment, ...], args: Tuple[Any, ...], kwargs: Dict
+    ):
+        self.ctx = ctx
+        self.path = path
+        self.args = args
+        self.kwargs = kwargs
+        self.dal_method = None  # Not resolved yet
+
+
+class DalMethodError(Exception):
+    def __init__(self, request: DalMethodRequest, path: Optional[Tuple[PathSegment]] = None):
+        self._request = request
+        self._path = path
+
+
+@dataclass
+class PathSegment:
+    """
+    This structure represents a segment of an attribute path.
+
+    For example, in this code:
+
+        dal.my_service.sub_service.other_service.method()
+
+    For the `dal` object, the entire attribute path would be:
+
+        my_service.sub_service.other_service.method
+
+    Which may be made up of PathSegments like:
+
+        PathSegment(name="my_service"), PathSegment(name="sub_service"), etc.
+    """
+    name: str
+
+    # A collection of meta properties.
+    # Example:
+    #   meta = {
+    #       "enabled": True
+    #   }
+    meta: dict
+
+    def __init__(self, name: str, **meta):
+        self.name = name
+        self.meta = meta
+
+
+class DalMethodRequester:
+    """
+    A utility class that defers access to DAL attributes.
+
+    Attribute access to the DAL is deferred so that the DAL can
+    run method middleware before and after calling a method.
+
+    Method middlewares may prevent method's from being called
+    by raising exceptions.
+    """
+
+    # Defining type here allows subclasses to easily provide another class
+    PathSegment = PathSegment
+
+    def __init__(self, handler: Callable, path: Tuple[PathSegment, ...]):
+        """
+        Args:
+            handler (Callable): A callable that handles calling the underlying
+                attribute by wrapping it so that method middleware can run before
+                and after calling a method
+                TODO: Consider using a custom type for the handler to represent
+                      or document the interface to that callable.
+            path (Tuple[PathSegment, ...]): A tuple of PathSegments representing
+                the current attribute path that has been requested.
+        """
+        self._handler = handler
+        self.path = path
+
+    def __getattr__(self, name: str) -> DalMethodRequester:
+        return self.__class__(self._handler, self.path + (self.PathSegment(name=name),))
+
+    def __call__(self, *args, **kwargs):
+        return self._handler(self.path, *args, **kwargs)
+
+
+class MethodMiddleware:
+    """
+    Base class used primarily for type checking and to provide
+    an interface for a method middleware.
+    """
+    def __call__(self, request: DalMethodRequest, handler: Callable):
+        pass
+
+
+def dal_resolver(ctx, dmr):
+    """
+    This function resolves a dal method call to its underlying
+    service
+    """
+    return resolve(DalMethodRequest(ctx=ctx, path=dmr.path, args=None, kwargs=None))
+
+
+def resolve(request: DalMethodRequest):  ## noqa
+    """
+    This function resolves a DalMethodRequest to the a service method
+    """
+    service_or_method = request.ctx.dal._services  # noqa
+    paths = list(request.path[:])
+    location = []
+    while paths:
+        path_segment = paths.pop(0)
+        location.append(path_segment)
+        # Third time through, service_or_method might be `None`, but we want
+        # to continue walking the path. Everything after the first missing
+        # service/method will be `(location, None)`.
+        if service_or_method:
+
+            # This if condition is handling the case of the first loop here.
+            # we cannot use attribute access on the dal directly because of how
+            # attribute access is deferred with DalMethodRequest objects.
+            if isinstance(service_or_method, dict):
+
+                # If the code being resolved has typo'd a service name, this
+                # could be returning something that is not a service.
+                service_or_method = service_or_method.get(path_segment.name)
+            else:
+                # second time through (and beyond), service or method is a real
+                # service or method, and we do not need to use a special case for
+                # finding the first service.
+                try:
+                    service_or_method = getattr(service_or_method, path_segment.name)
+                    if not service_or_method and callable(service_or_method):
+                        raise DalMethodError(request, path=tuple(location))
+
+                except KeyError:
+                    raise DalMethodError(request, path=tuple(location))
+        else:
+            raise DalMethodError(request, path=tuple(location))
+    return service_or_method
+
+
+class DalMethodResolverMiddleware(MethodMiddleware):
+    """
+    TODO: Review the implementation of this class.
+    """
+
+    def __call__(self, request: DalMethodRequest, handler: Callable):
+        """
+        Args:
+             request: Input from caller
+             handler: Downstream middleware or actual DAL method handler
+                Note: This is provided
+        """
+        request.dal_method = resolve(request)
+        return handler(request)
+
+
+def default_handle_dal_method(request: DalMethodRequest):
+    """
+    The default method middleware handler for a DalMethodRequester
+
+    Args:
+        request (DalMethodRequest): The method request context.
+
+    Returns: Mixed
+    """
+    assert request.dal_method, "DAL method not resolved"
+    return request.dal_method(*request.args, **request.kwargs)
+
+
+class InvalidMiddleware(Exception):
+    pass
 
 
 class DataAccessLayer(object):
@@ -12,9 +193,39 @@ class DataAccessLayer(object):
     Gives you access to a DataManager's services.
     """
 
-    def __init__(self, data_manager):
+    # default middleware classes need to be instantiated before being
+    # passed to the init function because the resulting object is called
+    # directly (__call__).
+    def __init__(
+        self,
+        data_manager,
+        middleware=None,
+        default_middleware=(DalMethodResolverMiddleware(),),
+        handler=default_handle_dal_method
+    ):
         self._services = {}
         self._data_manager = data_manager
+        self._handler = handler
+        self._reversed_middleware = []
+
+        middleware = middleware or []
+        if default_middleware:
+            middleware.extend(default_middleware)
+        for m in reversed(middleware):
+            # Be as helpful as we can to callers...
+            if isinstance(m, type):
+                m = m()
+            # ... but we want to be sure of the types of things we're dealing with
+            if not isinstance(m, MethodMiddleware):
+                raise InvalidMiddleware(f'{m} is not a valid method middleware type.')
+            self._reversed_middleware.append(m)
+
+        # Reverse middleware so that self._handler is the first middleware to call
+        # and at the end of the stack is `self._handle_dal_method`
+        for m in self._reversed_middleware:
+            self._handler = update_wrapper(
+                partial(m, handler=self._handler), self._handler
+            )
 
     def register_services(self, **services):
         """
@@ -50,9 +261,16 @@ class DataAccessLayer(object):
         self._services[key] = service
         return service
 
-    def __getattr__(self, name):
-        assert self._data_manager.get_active_context(), 'A DataAccessContext must be started to access the DAL.'
-        return self._services[name]
+    def _call(self, path: Tuple[PathSegment, ...], *args, **kwargs):
+        return self._handler(
+            request=DalMethodRequest(
+                self._data_manager.require_active_context(), path, args, kwargs
+            )
+        )
+
+    def __getattr__(self, name: str) -> DalMethodRequester:
+        assert self._data_manager.get_active_context(), "A DataAccessContext must be started to access the DAL."
+        return DalMethodRequester(self._call, path=(PathSegment(name=name),))
 
     def __getitem__(self, path):
         """
@@ -157,6 +375,15 @@ class DataManager(object):
         """
         if self.ctx_stack.top:
             return self.ctx_stack.top
+
+    def require_active_context(self):
+        """
+        Get the active context, but require it to actually be active.
+
+        :return: DataAccessContext
+        :raises: RuntimeError if no context is active
+        """
+        return self.ctx_stack()._get_current_object()
 
     @contextmanager
     def dal(self, meta=None):
