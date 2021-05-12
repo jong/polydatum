@@ -36,4 +36,4 @@ class Service(object):
         :return: DataAccessContext
         :raises: RuntimeError if no context is active
         """
-        return self._data_manager.ctx_stack()._get_current_object()
+        return self._data_manager.require_active_context()

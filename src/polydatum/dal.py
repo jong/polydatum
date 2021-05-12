@@ -90,50 +90,75 @@ class DalMethodRequester:
                 the current attribute path that has been requested.
         """
         self._handler = handler
-        self._path = path
+        self.path = path
 
     def __getattr__(self, name: str) -> DalMethodRequester:
-        return self.__class__(self._handler, self._path + (self.PathSegment(name=name),))
+        return self.__class__(self._handler, self.path + (self.PathSegment(name=name),))
 
     def __call__(self, *args, **kwargs):
-        return self._handler(self._path, *args, **kwargs)
+        return self._handler(self.path, *args, **kwargs)
 
 
-class DalMethodResolverMiddleware:
+class MethodMiddleware:
+    """
+    Base class used primarily for type checking and to provide
+    an interface for a method middleware.
+    """
+    def __call__(self, request: DalMethodRequest, handler: Callable):
+        pass
+
+
+def dal_resolver(ctx, dmr):
+    """
+    This function resolves a dal method call to its underlying
+    service
+    """
+    return resolve(DalMethodRequest(ctx=ctx, path=dmr.path, args=None, kwargs=None))
+
+
+def resolve(request: DalMethodRequest):  ## noqa
+    """
+    This function resolves a DalMethodRequest to the a service method
+    """
+    service_or_method = request.ctx.dal._services  # noqa
+    paths = list(request.path[:])
+    location = []
+    while paths:
+        path_segment = paths.pop(0)
+        location.append(path_segment)
+        # Third time through, service_or_method might be `None`, but we want
+        # to continue walking the path. Everything after the first missing
+        # service/method will be `(location, None)`.
+        if service_or_method:
+
+            # This if condition is handling the case of the first loop here.
+            # we cannot use attribute access on the dal directly because of how
+            # attribute access is deferred with DalMethodRequest objects.
+            if isinstance(service_or_method, dict):
+
+                # If the code being resolved has typo'd a service name, this
+                # could be returning something that is not a service.
+                service_or_method = service_or_method.get(path_segment.name)
+            else:
+                # second time through (and beyond), service or method is a real
+                # service or method, and we do not need to use a special case for
+                # finding the first service.
+                try:
+                    service_or_method = getattr(service_or_method, path_segment.name)
+                    if not service_or_method and callable(service_or_method):
+                        raise DalMethodError(request, path=tuple(location))
+
+                except KeyError:
+                    raise DalMethodError(request, path=tuple(location))
+        else:
+            raise DalMethodError(request, path=tuple(location))
+    return service_or_method
+
+
+class DalMethodResolverMiddleware(MethodMiddleware):
     """
     TODO: Review the implementation of this class.
     """
-    def _walk_path(self, request: DalMethodRequest):  ## noqa
-        service_or_method = request.ctx.dal._services  # noqa
-        paths = list(request.path[:])
-        # paths = (PathSegment("foo"), PathSegment("bar"), PathSegment("baz"))
-        # location = [PathSegment("foo"), PathSegment("bar")] on second yield
-        location = []
-        while paths:
-            path_segment = paths.pop(0)
-            location.append(path_segment)
-            # Third time through, service_or_method might be `None`, but we want
-            # to continue walking the path. Everything after the first missing
-            # service/method will be `(location, None)`.
-            if service_or_method:
-                if isinstance(service_or_method, dict):
-                    # first time through, service_or_method is a dict of services
-                    service_or_method = service_or_method.get(path_segment.name)
-                else:
-                    # second time through, service_or_method is
-                    service_or_method = getattr(service_or_method, path_segment.name)
-                yield location, service_or_method
-            else:
-                yield location, None
-
-    def _resolve(self, request: DalMethodRequest):
-        service_or_method = None
-        for (path_segments, service_or_method) in self._walk_path(request):
-            if not service_or_method:
-                # If this is None, this means we've walked too far down
-                # the path, and don't have any other attributes to resolve.
-                raise DalMethodError(request, path=path_segments)
-        return service_or_method
 
     def __call__(self, request: DalMethodRequest, handler: Callable):
         """
@@ -142,12 +167,8 @@ class DalMethodResolverMiddleware:
              handler: Downstream middleware or actual DAL method handler
                 Note: This is provided
         """
-        service_or_method = self._resolve(request)
-        if service_or_method and callable(service_or_method):
-            request.dal_method = service_or_method
-            return handler(request)
-        else:
-            raise DalMethodError(request)
+        request.dal_method = resolve(request)
+        return handler(request)
 
 
 def default_handle_dal_method(request: DalMethodRequest):
@@ -161,6 +182,10 @@ def default_handle_dal_method(request: DalMethodRequest):
     """
     assert request.dal_method, "DAL method not resolved"
     return request.dal_method(*request.args, **request.kwargs)
+
+
+class InvalidMiddleware(Exception):
+    pass
 
 
 class DataAccessLayer(object):
@@ -181,13 +206,23 @@ class DataAccessLayer(object):
         self._services = {}
         self._data_manager = data_manager
         self._handler = handler
+        self._reversed_middleware = []
+
         middleware = middleware or []
         if default_middleware:
             middleware.extend(default_middleware)
+        for m in reversed(middleware):
+            # Be as helpful as we can to callers...
+            if isinstance(m, type):
+                m = m()
+            # ... but we want to be sure of the types of things we're dealing with
+            if not isinstance(m, MethodMiddleware):
+                raise InvalidMiddleware(f'{m} is not a valid method middleware type.')
+            self._reversed_middleware.append(m)
 
         # Reverse middleware so that self._handler is the first middleware to call
         # and at the end of the stack is `self._handle_dal_method`
-        for m in reversed(middleware):
+        for m in self._reversed_middleware:
             self._handler = update_wrapper(
                 partial(m, handler=self._handler), self._handler
             )
@@ -229,7 +264,7 @@ class DataAccessLayer(object):
     def _call(self, path: Tuple[PathSegment, ...], *args, **kwargs):
         return self._handler(
             request=DalMethodRequest(
-                self._data_manager.get_active_context(), path, args, kwargs
+                self._data_manager.require_active_context(), path, args, kwargs
             )
         )
 
@@ -340,6 +375,15 @@ class DataManager(object):
         """
         if self.ctx_stack.top:
             return self.ctx_stack.top
+
+    def require_active_context(self):
+        """
+        Get the active context, but require it to actually be active.
+
+        :return: DataAccessContext
+        :raises: RuntimeError if no context is active
+        """
+        return self.ctx_stack()._get_current_object()
 
     @contextmanager
     def dal(self, meta=None):

@@ -1,3 +1,8 @@
+import pytest
+
+from polydatum.dal import PathSegment
+
+
 def test_path_segment():
     """
     Verify that we can set and get the name attribute for a PathSegment,
@@ -9,5 +14,14 @@ def test_path_segment():
     Verify that no keyword args are necessary.
     Verify that kwargs are bundled under the meta dict.
     """
-    pass
+    # name is required
+    with pytest.raises(TypeError):
+        PathSegment()
 
+    name = 'example'
+    p = PathSegment(name)
+    assert p.name == name
+    assert p.meta == dict()
+
+    p = PathSegment(name, example='foo')
+    assert p.meta['example'] == 'foo'
