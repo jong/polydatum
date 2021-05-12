@@ -103,7 +103,7 @@ class DalMethodResolverMiddleware:
     """
     TODO: Review the implementation of this class.
     """
-    def walk_path(self, request: DalMethodRequest):  ## noqa
+    def _walk_path(self, request: DalMethodRequest):  ## noqa
         service_or_method = request.ctx.dal._services  # noqa
         paths = list(request.path[:])
         # paths = (PathSegment("foo"), PathSegment("bar"), PathSegment("baz"))
@@ -126,9 +126,9 @@ class DalMethodResolverMiddleware:
             else:
                 yield location, None
 
-    def resolve(self, request: DalMethodRequest):
+    def _resolve(self, request: DalMethodRequest):
         service_or_method = None
-        for (path_segments, service_or_method) in self.walk_path(request):
+        for (path_segments, service_or_method) in self._walk_path(request):
             if not service_or_method:
                 # If this is None, this means we've walked too far down
                 # the path, and don't have any other attributes to resolve.
@@ -142,7 +142,7 @@ class DalMethodResolverMiddleware:
              handler: Downstream middleware or actual DAL method handler
                 Note: This is provided
         """
-        service_or_method = self.resolve(request)
+        service_or_method = self._resolve(request)
         if service_or_method and callable(service_or_method):
             request.dal_method = service_or_method
             return handler(request)
